@@ -104,11 +104,15 @@ Apply? [y/N/d=show diff]
 
 ### What C fixes, and the 25-line rule
 
-Indentation (tabs), spacing, `return (x);`, braces on their own line, one declaration per line, declaration/assignment split, declarations moved to the top, aligned names, blank lines, `#` indentation, header guard name, blank line between functions, struct member alignment, blank line after the preprocessor block.
+Indentation (tabs, including nested unbraced `if`/`else`), spacing (operators, keywords, casts, `sizeof`), `return (x);`, braces on their own line (functions, control structures, `struct`/`union`/`enum`, one-line `{ a; b; }` blocks), several statements on one line, operators moved from the end of a line to the start of the next, multi-line function signatures joined when they fit in 80 columns, one declaration per line, declaration/assignment split, declarations moved to the top, aligned names, blank lines, `#` indentation, header guard name, blank line between functions, struct member alignment, blank line after the preprocessor block.
 
 A fix that needs extra lines (split `int i = 0;`, `if (x) {` brace split, `if (x) return (1);`, blank after declarations...) is **only applied if the function stays <= 25 lines**; otherwise the code is left alone and the error is printed with its line and *"not auto-fixed: it would make the function exceed 25 lines"*.
 
-Reported but never changed: `for` / `switch` / `case` / `goto` / `do`, ternaries, VLAs, comments in functions, > 25 lines, > 4 params, > 5 variables, > 5 functions per file, lines > 80 cols, naming prefixes, uppercase identifiers and macros, structs in `.c`, multiline macros.
+Collapsed code: a file whose statements, braces and `#include`s were squashed onto one or a few lines is split back into one statement per line (a `#define` squashed with other code cannot be split, nobody can tell where it ends). CR-only and CRLF files are converted to LF. Conditions longer than 80 columns are wrapped before `&&` / `||`.
+
+Blank lines: all blank lines inside a function are removed except the single one after the declarations (an existing one is never dropped, even in a function that is already too long); consecutive blank lines are collapsed; a blank line is enforced between functions and after the preprocessor block.
+
+Reported but never changed: brace initialisers on a declaration (`int a[3] = {1, 2, 3};` cannot be split), `for` / `switch` / `case` / `goto` / `do`, ternaries, VLAs, comments in functions, > 25 lines, > 4 params, > 5 variables, > 5 functions per file, lines > 80 cols, naming prefixes, uppercase identifiers and macros, structs in `.c`, multiline macros.
 
 ```
 ft_split.c: Error!

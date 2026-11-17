@@ -122,6 +122,18 @@ def match_paren(s, i):
     return -1
 
 
+def match_brace(s, i):
+    d = 0
+    for j in range(i, len(s)):
+        if s[j] == '{':
+            d += 1
+        elif s[j] == '}':
+            d -= 1
+            if d == 0:
+                return j
+    return -1
+
+
 def split_top(s, sep=','):
     parts, depth, cur = [], 0, ''
     for c in s:
@@ -177,6 +189,8 @@ def fix_spacing(m):
     m = BIN_AM.sub(lambda g: _op_ctx(g, 2), m)
     m = re.sub(r'\b(if|while|switch|for)\s*\(', r'\1 (', m)
     m = re.sub(r'\bsizeof\s+\(', 'sizeof(', m)
+    m = re.sub(r'\)(?=sizeof\b)', ') ', m)
+    m = re.sub(r'(\bsizeof\((?:[^()]|\([^()]*\))*\))\s*([*/%+\-])(?![=+\-])\s*(?=[\w(])', r'\1 \2 ', m)
     m = re.sub(r'\b(?!(?:if|while|switch|for|return|else|do|case|sizeof|%s)\b)'
                r'(\w+)\s+\(' % TYPEKW, r'\1(', m)
     m = re.sub(r'\(\s+', '(', m)
@@ -292,8 +306,17 @@ def parse_sig(ms):
 # --------------------------------------------------------------------------
 # Splitting one-liners (braces, control structures)
 # --------------------------------------------------------------------------
+def split_stmts(inner):
+    return [x.strip() + ';' for x in split_top(inner, ';') if x.strip()]
+
+
 def split_line(m):
     m = m.strip()
+    if m.startswith('{') and m.endswith('}') and len(m) > 2 and match_brace(m, 0) == len(m) - 1:
+        parts = ['{']
+        for st in split_stmts(m[1:-1]):
+            parts += split_line(st)
+        return parts + ['}']
     if m.startswith('}') and len(m) > 1:
         rest = m[1:].strip()
         if rest and rest[0] not in ';,':
@@ -312,6 +335,10 @@ def split_line(m):
         h, rest = 'else', m[4:].strip()
     if h and rest and rest != ';':
         return [h] + split_line(rest)
+    if not re.match(r'^for\b', m):
+        pieces = [x for x in split_top(m, ';') if x.strip()]
+        if len(pieces) >= 2 and m.endswith(';'):
+            return [fix_spacing(x.strip() + ';') for x in pieces]
     return [m]
 
 
@@ -326,8 +353,11 @@ def build_items(body):
         if was or is_comment_only(m):
             items.append({'k': 'cmt', 'raw': raw.rstrip(), 'verb': was})
             continue
-        if not m.strip():
-            continue                       # blank lines inside a function: dropped
+        if not m.strip():                  # blank lines inside a function are dropped...
+            if items and items[-1]['k'] == 'decl' and items[-1]['depth'] == 0 \
+                    and all(i_['k'] in ('decl', 'cmt') for i_ in items):
+                items.append(dict(BLANK))  # ...except the one closing the declarations
+            continue
         code, tail = peel_comment(m.strip(), lits)
         it = {'k': 'stmt', 'lits': lits, 'tail': tail, 'depth': depth}
         pd = parse_decl(code)
@@ -353,6 +383,15 @@ def lead_end(items):
 BLANK = {'k': 'blank'}
 
 
+def tidy_blanks(items):
+    """Keep a single blank: right after the leading declarations, never trailing."""
+    end = lead_end(items)
+    res = [it for i, it in enumerate(items) if it['k'] != 'blank' or (i == end and end > 0)]
+    while res and res[-1]['k'] == 'blank':
+        res.pop()
+    return res
+
+
 def assign_item(d, lits, depth=0):
     return {'k': 'stmt', 'lits': lits, 'tail': '', 'depth': depth,
             'm': fix_spacing('%s = %s;' % (d['name'], d['init']))}
@@ -361,6 +400,16 @@ def assign_item(d, lits, depth=0):
 def apply_ops(items):
     def fits(new, old):
         return len(new) <= MAX_FUNC_LINES or len(new) <= len(old)
+
+    # 0. a line must not end with an operator: move it to the next line
+    EOL_OP = re.compile(r'\s(&&|\|\||==|!=|<=|>=|<|>|\+|-|\*|/|%|\||&|\^)$')
+    for j in range(len(items) - 1):
+        a_, b_ = items[j], items[j + 1]
+        if a_['k'] == b_['k'] == 'stmt' and not a_['tail']:
+            mm = EOL_OP.search(a_['m'])
+            if mm:
+                a_['m'] = a_['m'][:mm.start()].rstrip()
+                b_['m'] = mm.group(1) + ' ' + b_['m']
 
     # 1. declarations in the middle of the function -> move to the top
     failed = set()
@@ -387,12 +436,16 @@ def apply_ops(items):
         else:
             failed.add(id(it))
 
+    items = tidy_blanks(items)
+
     # 2. empty line between declarations and the rest
     end = lead_end(items)
     if 0 < end < len(items) and items[end]['k'] != 'blank':
         new = items[:end] + [BLANK] + items[end:]
         if fits(new, items):
             items = new
+
+    items = tidy_blanks(items)
 
     # 3. one declaration per line
     j = 0
@@ -425,6 +478,8 @@ def apply_ops(items):
                     d['init'] = None
                     pos += 1
 
+    items = tidy_blanks(items)
+
     # 5. braces / control structures on their own line
     j = 0
     while j < len(items):
@@ -439,7 +494,44 @@ def apply_ops(items):
                     items = new
                     continue                # re-examine the first new part
         j += 1
+
+    # 6. wrap lines longer than 80 columns at && / ||
+    for _ in range(30):
+        render(items)
+        for k, it in enumerate(items):
+            if it['k'] != 'stmt':
+                continue
+            if it['ind'] * TAB + len(restore(it['m'], it['lits'])) <= MAX_COLS:
+                continue
+            parts = wrap_logic(it, it['ind'])
+            if parts:
+                new = items[:k] + parts + items[k + 1:]
+                if fits(new, items):
+                    items = new
+                    break
+        else:
+            break
     return items
+
+
+def wrap_logic(it, ind):
+    """Split a too-long condition before && / || so every line fits in 80 columns."""
+    toks = re.split(r'\s(&&|\|\|)\s', it['m'])
+    if len(toks) < 3:
+        return None
+    lines = [toks[0]]
+    for op, t in zip(toks[1::2], toks[2::2]):
+        cand = lines[-1] + ' ' + op + ' ' + t
+        w = (ind if len(lines) == 1 else ind + 1) * TAB + len(restore(cand, it['lits']))
+        if w <= MAX_COLS:
+            lines[-1] = cand
+        else:
+            lines.append(op + ' ' + t)
+    if len(lines) < 2:
+        return None
+    parts = [dict(it, m=x, tail='') for x in lines]
+    parts[-1]['tail'] = it['tail']
+    return parts
 
 
 CONT_START = re.compile(r'^(&&|\|\||[+\-*/%|^<>?:]|==|!=)\s')
@@ -448,7 +540,8 @@ CONT_END = re.compile(r'(&&|\|\||,|[^=!<>+\-*/%&|^]=)$')
 
 def render(items):
     base, stack, pending = 1, [], 0
-    paren, hdr_flag, stmt_ind, cont = 0, False, 1, False
+    paren, hdr_flag, stmt_ind, cont = 0, None, 1, False
+    open_ifs = []
     for it in items:
         k = it['k']
         if k == 'blank':
@@ -456,7 +549,7 @@ def render(items):
             continue
         if k == 'cmt':
             it['ind'] = base + pending
-            it['text'] = it['raw'] if it['verb'] else it['raw'].strip()
+            it['text'] = it['raw'] if it['verb'] else '\t' * it['ind'] + it['raw'].strip()
             continue
         if k == 'decl':
             it['ind'] = base + pending
@@ -472,11 +565,16 @@ def render(items):
         elif s.startswith('}'):
             ind, b = stack.pop() if stack else (base - 1, base - 1)
             base, pending = b, 0
+            open_ifs = [x for x in open_ifs if x <= ind]
         else:
             ind = base + pending
             is_hdr = bool(re.match(r'^(else\s+if|if|while|for|else)\b', s)) and not s.endswith(';')
+            if re.match(r'^else\b', s) and open_ifs and open_ifs[-1] >= base:
+                ind = open_ifs.pop()
             if is_hdr:
-                hdr_flag = True
+                hdr_flag = ind
+                if re.match(r'^(else\s+)?if\b', s):
+                    open_ifs.append(ind)
             else:
                 pending = 0
         if not (paren > 0 or cont or CONT_START.match(s)):
@@ -485,9 +583,9 @@ def render(items):
         cont = bool(CONT_END.search(s))
         if paren <= 0:
             paren = 0
-            if hdr_flag:
-                pending += 1
-                hdr_flag = False
+            if hdr_flag is not None:
+                pending = hdr_flag + 1 - base
+                hdr_flag = None
         it['ind'] = ind
         it['text'] = '\t' * ind + restore(s, it['lits']) + \
             ((' ' + restore(it['tail'], it['lits'])) if it['tail'] else '')
@@ -553,12 +651,102 @@ def depth_map(lines):
     return depths
 
 
+BLOCK_ONE = re.compile(r'^(?P<head>(?:typedef\s+)?(?:struct|union|enum)\b[^{;=]*)\{(?P<body>.*)\}\s*(?P<name>[\w\s]*);$')
+BLOCK_OPEN = re.compile(r'^(?:typedef\s+)?(?:struct|union|enum)\b[^;={}]*\{$')
+
+
+def expand_blocks(ln, m, lits):
+    """`enum e { A, B };` / `struct s {` at global scope -> one item per line."""
+    mm = BLOCK_ONE.match(m.strip())
+    if mm:
+        head = restore(re.sub(r'\s+', ' ', mm['head']).strip(), lits)
+        sep = ',' if re.match(r'^(typedef\s+)?enum\b', head) else ';'
+        items = [x.strip() for x in split_top(mm['body'], sep) if x.strip()]
+        body = ['\t' + restore(x, lits) + (sep if (sep == ';' or i < len(items) - 1) else '')
+                for i, x in enumerate(items)]
+        name = mm['name'].strip()
+        return [head, '{'] + body + ['}' + (' ' + name if name else '') + ';']
+    if BLOCK_OPEN.match(m.strip()):
+        return [restore(m.strip()[:-1].strip(), lits), '{']
+    return None
+
+
+PPDIR = r'(?:include|define|undef|ifndef|ifdef|if|else|elif|endif|pragma|error)'
+INC_TAIL = re.compile(r'^(#\s*include\s*(?:[' + PHC + r']|<[^>]*>))\s+(\S.*)$')
+
+
+def cut_code(m):
+    """Cut positions that put each statement / brace of a masked code string on its own line."""
+    cuts, p, stack = set(), 0, []
+    for i, c in enumerate(m):
+        inside_init = bool(stack) and stack[-1] == 'i'
+        if c in '([':
+            p += 1
+        elif c in ')]':
+            p -= 1
+        elif c == '{':
+            init = inside_init or m[:i].rstrip()[-1:] == '='
+            stack.append('i' if init else 'b')
+            if not init and m[i + 1:].strip():
+                cuts.add(i + 1)
+        elif c == '}':
+            kind = stack.pop() if stack else 'b'
+            if kind == 'b':
+                if m[:i].strip() and m[:i].rstrip()[-1:] != '{':
+                    cuts.add(i)
+                rest = m[i + 1:].lstrip()
+                if rest and not is_comment_only(rest) and not re.match(r'^(;|,|\)|\w[\w\s*,\[\]]*;)', rest):
+                    cuts.add(i + 1)
+        elif c == ';' and p == 0 and not inside_init:
+            rest = m[i + 1:].strip()
+            if rest and not is_comment_only(rest):
+                cuts.add(i + 1)
+    pts = [0] + sorted(cuts) + [len(m)]
+    return [m[a:b].strip() for a, b in zip(pts, pts[1:]) if m[a:b].strip()]
+
+
+def explode_line(raw, in_cmt):
+    """One physical line holding several statements / directives -> several lines."""
+    m, lits, cmt_after = protect(raw, in_cmt)
+    ms = m.strip()
+    if in_cmt or not ms or is_comment_only(m):
+        return [raw], cmt_after
+    parts = [x for x in re.split(r'(?<=\S)\s+(?=#\s*%s\b)' % PPDIR, ms) if x]
+    pieces = []
+    for part in parts:
+        if part.startswith('#'):
+            mm = INC_TAIL.match(part)
+            if mm and not is_comment_only(mm.group(2)):
+                pieces += [mm.group(1)] + cut_code(mm.group(2))
+            else:
+                pieces.append(part)
+        else:
+            pieces += cut_code(part)
+    if len(pieces) <= 1 or BLOCK_ONE.match(ms):
+        return [raw], cmt_after
+    return [restore(x, lits) for x in pieces], cmt_after
+
+
+def explode_lines(lines):
+    out, cmt = [], False
+    for ln in lines:
+        new, cmt = explode_line(ln, cmt)
+        out.extend(new)
+    return out
+
+
 def kr_split(lines):
-    """`int f(void) {`  ->  two lines (function definitions only)."""
+    """`int f(void) {`  ->  two lines (function definitions, struct/union/enum)."""
     depths, res, cmt = depth_map(lines), [], False
     for ln, d in zip(lines, depths):
-        m, _, cmt2 = protect(ln, cmt)
+        m, lits, cmt2 = protect(ln, cmt)
         ms = m.strip()
+        if d == 0 and not cmt:
+            ex = expand_blocks(ln, m, lits)
+            if ex:
+                res.extend(ex)
+                cmt = cmt2
+                continue
         if d == 0 and not cmt and re.match(r'^(?!typedef|struct|union|enum)[A-Za-z_][^=]*\)\s*\{$', ms):
             res.append(ln.rstrip()[:-1].rstrip())
             res.append('{')
@@ -590,7 +778,20 @@ def scan_units(lines):
             units.append({'k': 'pp', 's': i, 'e': j + 1})
             i = j + 1
             continue
-        brace_next = i + 1 < n and lines[i + 1].strip() == '{'
+        sig_e = i
+        if '(' in ms and ms.count('(') > ms.count(')') and not ms.startswith(('typedef', 'struct', 'union', 'enum')):
+            joined, c3 = ms, cmt
+            for k in range(i + 1, min(i + 8, n)):
+                m3, _, c3 = protect(lines[k], c3)
+                joined += ' ' + m3.strip()
+                sig_e = k
+                if joined.count('(') <= joined.count(')'):
+                    break
+            if joined.count('(') > joined.count(')'):
+                sig_e = i
+            else:
+                ms = joined.strip()
+        brace_next = sig_e + 1 < n and lines[sig_e + 1].strip() == '{'
         inline = ms.endswith('{')
         head = re.match(r'^(typedef\s+)?(struct|union|enum)\b', ms)
         kind = None
@@ -599,7 +800,7 @@ def scan_units(lines):
         elif brace_next and '(' in ms and ms.endswith(')'):
             kind = 'func'
         if kind:
-            b = i if inline and not brace_next else i + 1
+            b = i if inline and not brace_next else sig_e + 1
             depth, c2, end = 0, False, None
             for k in range(b, n):
                 m2, _, c2 = protect(lines[k], c2)
@@ -625,6 +826,18 @@ def fix_sig_line(raw):
     txt = '%s\t%s%s(%s)' % (sg['pre'], '*' * sg['stars'], sg['name'],
                             fmt_params(sg['params']))
     return restore(txt + (' ' + tail if tail else ''), lits)
+
+
+def fix_sig_lines(sig):
+    """Single-line signature -> normalised; multi-line -> joined if it fits in 80 columns."""
+    if len(sig) == 1:
+        return [fix_sig_line(sig[0])]
+    joined = ' '.join(x.strip() for x in sig)
+    one = fix_sig_line(joined)
+    if one != joined.rstrip() or parse_sig(protect(joined)[0].strip()):
+        if width(one) <= MAX_COLS:
+            return [one]
+    return [x.rstrip() for x in sig]
 
 
 def fix_pp(raw, depth):
@@ -782,7 +995,7 @@ def apply_includes(lines, fname, opt):
 
 def fix_source(src, fname, opt):
     orig_lines = src.replace('\r\n', '\n').split('\n')
-    lines = kr_split(norm_ws(src))
+    lines = kr_split(explode_lines(norm_ws(src)))
     header = []
     if has_header(lines):
         header, lines = lines[:11], lines[11:]
@@ -800,7 +1013,7 @@ def fix_source(src, fname, opt):
             if out and isinstance(out[-1], (str, dict)) and out[-1] != '' \
                     and units[idx - 1]['k'] not in ('cmt', 'blank'):
                 out.append('')
-            out.append(fix_sig_line(lines[s]) if u['b'] == s + 1 else lines[s].rstrip())
+            out.extend(fix_sig_lines(lines[s:u['b']]))
             out.append('{')
             out.extend(fix_body(lines[u['b'] + 1:e - 1]))
             out.append('}' if lines[e - 1].strip() == '}' else lines[e - 1].rstrip())
@@ -953,7 +1166,7 @@ def lint(text, fname, opt=None):
 def lint_func(lines, u, add, opt=None):
     s, b, e = u['s'], u['b'], u['e']
     body = lines[b + 1:e - 1]
-    sg = parse_sig(protect(lines[s])[0].strip())
+    sg = parse_sig(protect(' '.join(x.strip() for x in lines[s:b]))[0].strip())
     if opt is not None:
         check_func_name(sg, opt, s + 1, add)
     if sg:
@@ -1008,6 +1221,9 @@ def lint_func(lines, u, add, opt=None):
                     add(ln, 1, 'VLA_FBIDDEN', 'Variable Length Arrays are forbidden')
                 if d['init'] is not None and not keeps_init(pre, d):
                     add(ln, 1, 'DECL_ASSIGN_LINE', 'Declaration and assignation on a single line' + note(1))
+                elif d['init'] is not None and d['init'].startswith('{') \
+                        and not ({'static', 'const'} & set(pre.split())):
+                    add(ln, 1, 'DECL_ASSIGN_LINE', 'Brace initialiser on a declaration: cannot be split, assign element by element')
             if len(ds) > 1:
                 add(ln, 1, 'MULT_DECL_LINE', 'Multiple declarations on a single line' + note(len(ds) - 1))
             prev = 'decl'
@@ -1016,8 +1232,10 @@ def lint_func(lines, u, add, opt=None):
                 add(ln, 1, 'NL_AFTER_VAR_DECL', 'Missing empty line after variable declarations' + note(1))
             n = len(split_line(fix_spacing(code)))
             if n > 1:
-                if code.rstrip().endswith('{') or code.startswith('}'):
+                if code.rstrip().endswith('{') or code.startswith(('}', '{')):
                     add(ln, 1, 'BRACE_SHOULD_EOL', 'Braces must be alone on their line' + note(n - 1))
+                elif not re.match(r'^(else|if|while|for)\b', code):
+                    add(ln, 1, 'TOO_MANY_INSTR', 'Too many instructions on a single line' + note(n - 1))
                 else:
                     add(ln, 1, 'EXP_NEWLINE', 'Expected newline after control structure' + note(n - 1))
             seen_stmt, prev = True, 'stmt'
@@ -1877,7 +2095,7 @@ def main():
     bad, data = 0, []
     for path in files:
         try:
-            with open(path, encoding='utf-8') as f:
+            with open(path, encoding='utf-8', newline='') as f:
                 src = f.read()
         except (OSError, UnicodeDecodeError) as exc:
             print('%s: cannot read (%s)' % (path, exc))
@@ -1913,7 +2131,7 @@ def main():
     written = set()
     if write:
         for p, s_, n_ in changed:
-            with open(p, 'w', encoding='utf-8') as f:
+            with open(p, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(n_)
             written.add(p)
 
