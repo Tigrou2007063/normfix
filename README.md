@@ -16,6 +16,7 @@ The official **Norm / norminette only exists for C**. For the other languages 42
 | `--run` | ASan+UBSan / TSan / valgrind | same | runs the script, reports the exception | `cargo run`, reports panics | n/a |
 | 42 header | added by default | with `--header` | with `--header` | with `--header` (`//` style) | with `--header` |
 | `--forbid`, includes | yes | yes | `--forbid` | `--forbid` | n/a |
+| `--func-prefix` naming | yes | no | no | no | n/a |
 | Makefile audit | yes | yes (+ `-std=c++98` check) | if there is one | if there is one | if there is one |
 
 Other languages (Go, JS/TS, SQL...) are not supported yet, except for the optional header (`--header`, `--header-style`).
@@ -151,6 +152,17 @@ normfix --forbid 'printf,using namespace,friend' .   # C++, Python, Rust, C
 ```
 
 `--allowed-functions` compiles each `.c` and reads the undefined symbols with `nm`, so it only reports **real** calls (not comments or strings), with the line. Functions defined in the processed files are fine. Anything defined elsewhere (e.g. a `libft/` folder you did not pass) must be added to the list. Globals such as `stdout` or `errno` show up as symbols too.
+
+### Function naming (`ft_`...)
+
+```sh
+normfix --func-prefix ft_ .                       # every function must start with ft_
+normfix --func-prefix ft_ --skip-static .         # ...except static helpers
+normfix --func-pattern 'ft_[a-z0-9_]+' .          # or a full regex
+normfix --func-prefix ft_ --func-exempt main,debug_print .
+```
+
+Checked on function definitions in `.c` and on prototypes in `.h`; `main` is exempt by default. Reported as `FUNC_NAME_FORMAT` with the line, never auto-renamed (a rename would have to follow every call site). Put it in `.normfix.json` (`"func_prefix": "ft_"`) so each project carries its own rule: libft needs `ft_`, other projects usually do not.
 
 ### Makefile
 

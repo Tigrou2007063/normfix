@@ -872,7 +872,21 @@ def width(line):
     return len(line.expandtabs(TAB))
 
 
-def lint(text, fname):
+def check_func_name(sg, opt, line, add):
+    """--func-prefix / --func-pattern: naming format required by the subject (e.g. ft_)."""
+    prefix, pattern = getattr(opt, 'func_prefix', None), getattr(opt, 'func_pattern', None)
+    if not (prefix or pattern) or not sg:
+        return
+    name = sg['name']
+    if name in flat(opt.func_exempt) or ('static' in sg['pre'].split() and opt.skip_static):
+        return
+    if pattern and not re.fullmatch(pattern, name):
+        add(line, 1, 'FUNC_NAME_FORMAT', "Function name '%s' does not match %s" % (name, pattern))
+    elif prefix and not name.startswith(prefix):
+        add(line, 1, 'FUNC_NAME_FORMAT', "Function name '%s' must start with '%s'" % (name, prefix))
+
+
+def lint(text, fname, opt=None):
     errs = []
 
     def add(line, col, code, msg):
@@ -918,6 +932,8 @@ def lint(text, fname):
         elif k == 'line':
             m, lits, _ = protect(lines[s])
             code, _ = peel_comment(m.strip(), lits)
+            if opt is not None and code.endswith(');') and '=' not in code:
+                check_func_name(parse_sig(code[:-1]), opt, s + 1, add)
             tm = re.match(r'^typedef\b.*\b(\w+);$', code)
             if tm and not tm.group(1).startswith('t_'):
                 add(s + 1, 1, 'USER_DEFINED_TYPEDEF', 'typedef name must start with t_')
@@ -927,17 +943,19 @@ def lint(text, fname):
                 add(s + 1, 1, 'GLOBAL_VAR_DETECTED', 'Global variable present in file (forbidden unless the project allows it)')
         elif k == 'func':
             nfuncs += 1
-            lint_func(lines, u, add)
+            lint_func(lines, u, add, opt)
     if fname.endswith('.c') and nfuncs > MAX_FUNCS:
         add(1, 1, 'TOO_MANY_FUNCS', 'More than %d functions in the file (%d)' % (MAX_FUNCS, nfuncs))
     errs.sort()
     return errs
 
 
-def lint_func(lines, u, add):
+def lint_func(lines, u, add, opt=None):
     s, b, e = u['s'], u['b'], u['e']
     body = lines[b + 1:e - 1]
     sg = parse_sig(protect(lines[s])[0].strip())
+    if opt is not None:
+        check_func_name(sg, opt, s + 1, add)
     if sg:
         params = sg['params'].strip()
         nparams = 0 if params in ('', 'void') else len(split_top(params, ','))
@@ -1763,6 +1781,12 @@ def build_parser():
     g.add_argument('--allowed-functions', action='append', default=[], dest='allowed_functions', metavar='FUNCS',
                    help='C only: comma-separated authorised external functions (write,malloc,free); '
                         'any other external call (found with nm) is reported')
+    g.add_argument('--func-prefix', metavar='PREFIX',
+                   help='C: every function (definitions and prototypes) must start with PREFIX, e.g. ft_ (never auto-renamed)')
+    g.add_argument('--func-pattern', metavar='REGEX', help='C: function names must fully match this regex (overrides --func-prefix)')
+    g.add_argument('--func-exempt', action='append', default=['main'], metavar='NAMES',
+                   help='comma-separated function names exempt from the naming rule (default: main)')
+    g.add_argument('--skip-static', action='store_true', help='naming rule ignores static functions')
     g = ap.add_argument_group('Makefile')
     g.add_argument('--makefile', help='Makefile to check (default: searched next to the files / one level up)')
     g.add_argument('--no-makefile', action='store_true', help='skip the Makefile checks')
@@ -1905,7 +1929,7 @@ def main():
     allowed = allowed_check([(p, n_) for p, l, _, n_ in data if l == 'c'], opt, incs) if flat(opt.allowed_functions) else {}
     for path, lang, src, new in data:
         if lang == 'c':
-            errs = [x for x in lint(new, path) if x[2] != 'GLOBAL_VAR_DETECTED']
+            errs = [x for x in lint(new, path, opt) if x[2] != 'GLOBAL_VAR_DETECTED']
         else:
             errs = lint_generic(new, path, lang, opt)
         errs += forbid_errs(new, lang, opt)
